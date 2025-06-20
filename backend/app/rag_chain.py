@@ -3,25 +3,20 @@ from dotenv import load_dotenv
 from operator import itemgetter
 from typing import Iterable, List, Any, Dict, Literal, Optional
 import logging
+from collections import deque
+import tiktoken
 
 # Pydantic
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, field_validator, ValidationInfo
 
 # LangChain core
 from langchain_core.runnables import RunnableLambda
 from langchain_core.output_parsers import StrOutputParser, PydanticOutputParser
 from langchain.schema import Document
+from langchain.memory import ConversationTokenBufferMemory
 
 # LangChain prompts
 from langchain.prompts import PromptTemplate
-
-# LangChain community transformers (for duplicate filtering)
-from langchain_community.document_transformers import EmbeddingsRedundantFilter
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-# LangChain retrievers (for ensembling)
-from langchain.retrievers import EnsembleRetriever
-from langchain.retrievers.document_compressors import EmbeddingsFilter
 
 # Azure OpenAI embeddings & chat
 from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
@@ -30,7 +25,6 @@ from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 from pinecone import Pinecone              
 from langchain_pinecone import PineconeVectorStore    
 from pinecone_text.sparse import SpladeEncoder
-from langchain_core.retrievers import BaseRetriever
 
 # LLM cache
 from langchain_community.cache import InMemoryCache
@@ -40,22 +34,20 @@ from langchain.globals import set_llm_cache
 # Load environment variables once at module import
 load_dotenv()
 
-# Memory Cache for LLM
-set_llm_cache(InMemoryCache())
-
 # Config
 AZURE_OPENAI_API_KEY  = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_VER  = os.getenv("AZURE_OPENAI_API_VERSION")
 EMBEDDING_MODEL       = os.getenv("EMBEDDING_DEPLOYMENT_NAME")
-CHAT_MODEL            = os.getenv("CHAT_DEPLOYMENT_NAME")
+CHAT_DEPLOYMENT_NAME  = os.getenv("CHAT_DEPLOYMENT_NAME")
+CHAT_MODEL            = os.getenv("CHAT_MODEL_NAME", "gpt-4o")  # default to gpt-4o
 
 PINECONE_API_KEY      = os.getenv("PINECONE_API_KEY")
 DENSE_INDEX_NAME      = os.getenv("PINECONE_DENSE_INDEX_NAME")
 SPARSE_INDEX_NAME     = os.getenv("PINECONE_SPARSE_INDEX_NAME")
 
 # ── retrieval hyper-params (env-configurable) ────────────────────────────
-TOTAL_RETRIEVED_DOC_CHUNKS = int(os.getenv("TOTAL_RETRIEVED_DOC_CHUNKS", "20"))
+TOTAL_RETRIEVED_DOC_CHUNKS = int(os.getenv("TOTAL_RETRIEVED_DOC_CHUNKS", "8"))
 CHUNKS_PER_DOC             = int(os.getenv("CHUNKS_PER_DOC", "5"))
 
 # how many raw candidates to ask Pinecone for (dense & sparse)
@@ -65,13 +57,22 @@ TOP_K_PER_STAGE            = max(6, TOTAL_RETRIEVED_DOC_CHUNKS * 2)
 logging.info("Retriever config: TOP_K_PER_STAGE=%d  PER_DOC=%d  FINAL=%d",
              TOP_K_PER_STAGE, CHUNKS_PER_DOC, TOTAL_RETRIEVED_DOC_CHUNKS)
 
+# Chat History Config
+# Max tokens to be kept in memory for the conversation
+MAX_MEM_TOKENS = 80_000 
+# Last 5 user queries for retrieval (query fusion)
+USER_QUERIES: deque[str] = deque(maxlen=5)         
+# Sticky Filter Cache for Retriever
+LAST_FILTER: Dict[str, Dict[str, Any]] = {}
+# Memory Cache for LLM
+set_llm_cache(InMemoryCache())
+
 # (Optional) LangSmith tracing
 if os.getenv("LANGSMITH_TRACING_ACTIVE", "false").lower() == "true":
     os.environ["LANGCHAIN_TRACING_V2"] = "true"
     os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 
 # Pydantic Schema to do Metadata filter based off user query
-
 FORM_MAP = {
 "10K":  "10-K",  "10-K":  "10-K",
 "10Q":  "10-Q",  "10-Q":  "10-Q",
@@ -83,45 +84,137 @@ def _norm_form(v: str | None) -> str | None:
     v = v.upper().replace(" ", "").replace("-", "")
     return FORM_MAP.get(v, v)
 
-class QueryFilter(BaseModel):
-    """Structured representation of the user's request."""
-    symbol: List[str] | str                                            
-    type: Optional[Literal[
-        "sec_filing", "earnings_call_transcript", "company_profile"
-    ]] = None
-    form: Optional[Literal["10-K", "10-Q"]] = None  
-    year: Optional[int] = Field(None, ge=1900, le=2100)
-    quarter: Optional[int] = Field(None, ge=1, le=4)
+# ─── helper: merge two Pinecone-filter dicts  ───────────────────────────────
+def _merge_filters(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Union-merge list-based filters; for scalars fall back to replacement.
+    """
+    merged = {**old}
+    for k, v in new.items():
+        if _is_effectively_empty({k: v}):
+            continue
 
+        old_v = merged.get(k)
+        # ---- both are {"$in": [...] } ----------------------------------
+        if isinstance(old_v, dict) and "$in" in old_v \
+           and isinstance(v, dict) and "$in" in v:
+            merged[k] = {"$in": list(set(old_v["$in"]) | set(v["$in"]))}
+        # ---- new is {"$in": [...] }, old scalar ------------------------
+        elif isinstance(v, dict) and "$in" in v:
+            merged[k] = v if old_v is None else {"$in": list({old_v, *v["$in"]})}
+        # ---- new scalar, old {"$in": [...] } ---------------------------
+        elif isinstance(old_v, dict) and "$in" in old_v:
+            merged[k] = {"$in": list(set(old_v["$in"]) | {v})}
+        # ---- both scalars – keep **both** ------------------------------
+        elif old_v is not None and old_v != v:
+            merged[k] = {"$in": [old_v, v]}
+        else:
+            merged[k] = v
+    return merged
+
+
+
+def build_fused_query() -> str:
+    """Join up to five most-recent user questions (newline-separated)."""
+    return "\n".join(USER_QUERIES)
+
+def _to_list(v) -> list:
+    """None → []; scalar → [scalar]; list/{$in:[…]} unchanged."""
+    if v is None:
+        return []
+    if isinstance(v, dict) and "$in" in v:
+        v = v["$in"]
+    return v if isinstance(v, list) else [v]
+
+def _uniq(seq):
+    seen, out = set(), []
+    for x in seq:
+        if x not in seen:
+            out.append(x); seen.add(x)
+    return out
+
+ALLOWED_TYPES  = {"sec_filing", "earnings_call_transcript", "company_profile"}
+ALLOWED_FORMS  = {"10-K", "10-Q"}
+YEAR_RANGE     = (1900, 2100)          # inclusive
+ALLOWED_QTRS   = {1, 2, 3, 4}
+
+class QueryFilter(BaseModel):
+    # ── strings ───────────────────────────────────────────────
+    symbol : List[str] | str | None = None
+    type   : List[str] | str | None = None      # multiple allowed
+    form   : List[str] | str | None = None
+    # ── numbers ───────────────────────────────────────────────
+    year    : List[int] | int | None = None
+    quarter : List[int] | int | None = None
+
+    # ---------- NORMALISERS ----------
     @validator("symbol", pre=True, always=True)
-    def upper_symbol(cls, v):
-        if isinstance(v, str):
-            return [v.upper()]
-        # list of tickers
-        return [s.upper() for s in v]
+    def _to_list_upper(cls, v):
+        if v is None:
+            return []
+        return [s.upper() for s in (v if isinstance(v, list) else [v])]
+
+    @validator("type", pre=True)
+    def _norm_type(cls, v):
+        if v is None:
+            return []
+        items = [v] if isinstance(v, str) else v
+        bad   = [x for x in items if x not in ALLOWED_TYPES]
+        if bad:
+            raise ValueError(f"Unknown type(s): {', '.join(bad)}")
+        return items
 
     @validator("form", pre=True)
-    def normalise_form(cls, v):
-        return _norm_form(v)
+    def _norm_form(cls, v):
+        if v is None:
+            return []
+        items = [_norm_form(v)] if isinstance(v, str) else [_norm_form(x) for x in v]
+        bad   = [x for x in items if x not in ALLOWED_FORMS]
+        if bad:
+            raise ValueError(f"Unknown form(s): {', '.join(bad)}")
+        return items
 
+    @field_validator("year", "quarter", mode="before")
+    def _to_int_list(cls, v, info: ValidationInfo):
+        """
+        Accept single int/str or list[int/str]; always return List[int].
+        Also range-check the quarter field.
+        """
+        if v is None:
+            return []
+
+        # normalise to list
+        items = v if isinstance(v, list) else [v]
+        ints  = [int(x) for x in items]
+
+        if info.field_name == "quarter" and any(q not in range(1, 5) for q in ints):
+            raise ValueError("quarter must be between 1 and 4")
+
+        return ints
+
+    # ---------- CONVERSION TO PINECONE ----------
     def to_pinecone_filter(self) -> Dict[str, Any]:
-        f: Dict[str, Any] = {}
-        f["symbol"] = self.symbol
-        if len(self.symbol) == 1:
-            f["symbol"] = self.symbol[0]
-        else:
-            f["symbol"] = {"$in": self.symbol} 
-        if self.type:   f["type"]   = self.type
-        if self.form:   f["form"]   = self.form         
-        if self.year is not None:    f["year"]    = int(self.year)
-        if self.quarter is not None: f["quarter"] = int(self.quarter)
-        return f
+        def one_or_in(seq):
+            if not seq:
+                return None
+            return seq[0] if len(seq) == 1 else {"$in": seq}
+
+        return {k: v for k, v in {
+            "symbol" : one_or_in(self.symbol),
+            "type"   : one_or_in(self.type),
+            "form"   : one_or_in(self.form),
+            "year"   : one_or_in(self.year),
+            "quarter": one_or_in(self.quarter),
+        }.items() if v is not None}
+
+
 
 # ------------------------- LLM extraction chain (GPT-4o) -------------------------
 _extract_llm = AzureChatOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-    deployment_name=os.getenv("CHAT_DEPLOYMENT_NAME"),
+    deployment_name=CHAT_DEPLOYMENT_NAME,
+    model_name=CHAT_MODEL,
     api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
     temperature=0,
 )
@@ -129,19 +222,29 @@ _extract_llm = AzureChatOpenAI(
 _parser = PydanticOutputParser(pydantic_object=QueryFilter)
 
 _extract_prompt = PromptTemplate(
-    template="""
-You are a parser that extracts structured filters from a user question
-about financial documents. 
-Output MUST be valid JSON matching this schema:
+    template="""\
+**Task**  
+Extract only the *metadata filters* explicitly requested in the question.
+
+Return **_valid JSON_** – nothing else – matching this schema:
 {format}
 
-User question: "{question}"
+**Allowed values**
+• "type"   → {{"sec_filing","earnings_call_transcript","company_profile"}}  
+• "form"   → {{"10-K","10-Q"}}  
+• "year"   → integers 1900-2100 (single or list)  
+• "quarter"→ 1-4 (single or list)  
+• "symbol" → stock tickers (single or list)
 
-"You may output multiple symbols separated by commas, e.g. \"AAPL, MSFT\".\n"
+Always emit arrays when multiple values are present.
+
+User question:
+"{question}"
 """,
     input_variables=["question"],
     partial_variables={"format": _parser.get_format_instructions()},
 )
+
 
 extract_chain = _extract_prompt | _extract_llm | _parser
 
@@ -182,6 +285,19 @@ def make_retrieve_fn(
     # ──────────────────────────────────────────────────────────────────────
     # helper nested inside so it can use dense_store / sparse_index
     # ──────────────────────────────────────────────────────────────────────
+    def _sparse(q_text: str, flt: Dict[str, Any]) -> list[Document]:
+        sv  = sparse_encoder.encode_queries([q_text])[0]
+        res = sparse_index.query(
+            sparse_vector=sv,
+            top_k=TOP_K_PER_STAGE,
+            include_metadata=True,
+            filter=flt or None
+        )
+        return [
+            Document(page_content=m["metadata"]["text"], metadata=m["metadata"])
+            for m in res["matches"]
+        ]
+
     def pinecone_search(q_text: str, base_filter: Dict[str, Any]) -> tuple[list[Document], list[Document]]:
         """Try full filter → drop quarter → drop year → no filter."""
         # 1. full filter
@@ -209,55 +325,73 @@ def make_retrieve_fn(
             dense_store.similarity_search(q_text, k=TOP_K_PER_STAGE),
             _sparse(q_text, {})  
         )
+    
+    def _retrieve(fused_query: str, convo_id: str = "default") -> List[Document]:
+        """
+        * fused_query   –  all user questions joined by `\n`
+        * convo_id      –  stickiness per chat session
+        """
+        # 1️⃣ parse metadata from the *fused* 5-turn window
+        qf        = extract_chain.invoke({"question": fused_query})
+        fresh_flt   = qf.to_pinecone_filter()
 
-    def _sparse(q_text: str, flt: Dict[str, Any]) -> list[Document]:
-        sv  = sparse_encoder.encode_queries([q_text])[0]
-        res = sparse_index.query(
-            sparse_vector=sv,
-            top_k=TOP_K_PER_STAGE,
-            include_metadata=True,
-            filter=flt or None
-        )
-        return [
-            Document(page_content=m["metadata"]["text"], metadata=m["metadata"])
-            for m in res["matches"]
-        ]
+        # 2️⃣ merge with previous sticky filter
+        base_flt    = _merge_filters(LAST_FILTER.get(convo_id, {}), fresh_flt)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # main callable used by LangChain
-    # ──────────────────────────────────────────────────────────────────────
-    def _retrieve(question: str) -> List[Document]:
-        qf: QueryFilter = extract_chain.invoke({"question": question})
-        pc_filter       = qf.to_pinecone_filter()
-
-        dense_docs, sparse_docs = pinecone_search(question, pc_filter)
+        # 3️⃣ run retrieval
+        dense_docs, sparse_docs = pinecone_search(fused_query, base_flt)
         merged = rrf_merge(dense_docs, sparse_docs, k=TOP_K_PER_STAGE * 2)
 
+        # 4️⃣ filing / chunk caps (unchanged)
         by_blob: Dict[str, List[Document]] = {}
         for d in merged:
             key = d.metadata.get("symbol") + "|" + d.metadata.get("blob_name")
             by_blob.setdefault(key, []).append(d)
 
-        # flatten with a two-level cap: first per filing, then per symbol
         per_filing = [d for docs in by_blob.values() for d in docs[:CHUNKS_PER_DOC]]
+        final      = per_filing[:TOTAL_RETRIEVED_DOC_CHUNKS]
 
-        by_symbol: Dict[str, List[Document]] = {}
-        for d in per_filing:
-            by_symbol.setdefault(d.metadata.get("symbol", "UNK"), []).append(d)
-            
-        merged = (
-            [d for docs in by_blob.values() for d in docs[:CHUNKS_PER_DOC]]
-            [:TOTAL_RETRIEVED_DOC_CHUNKS]           # overall limit
-            )
-        if not pc_filter:
-            debug = "[DEBUG] ⚠️  No metadata filters detected — vector-only search.\n"
-            merged.insert(0, Document(page_content=debug, metadata={}))
+        # 5️⃣ save sticky filter *only* if retrieval succeeded
+        if merged:
+            LAST_FILTER[convo_id] = base_flt
 
-        return merged
+        return final
+    
+    return RunnableLambda(lambda q: _retrieve(q))
 
-    return RunnableLambda(_retrieve)
+def _is_effectively_empty(f: Dict[str, Any]) -> bool:
+    """
+    A filter is 'empty' when it does **not** constrain retrieval.
+    We treat {'symbol': [''], 'type': None, …} or {} as empty.
+    """
+    if not f:
+        return True
+    # symbol could be '', [], or {"$in": []}
+    sym = f.get("symbol")
+    if sym in (None, "", [], {"$in": []}):
+        sym_ok = True
+    else:
+        sym_ok = False
+    others_present = any(k for k in f if k != "symbol")
+    return sym_ok and not others_present
 
+# 1️⃣  the LLM used inside memory
+memory_llm = AzureChatOpenAI(
+    api_key=AZURE_OPENAI_API_KEY,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    deployment_name=CHAT_DEPLOYMENT_NAME,
+    model_name=CHAT_MODEL,
+    api_version=AZURE_OPENAI_API_VER,
+)
 
+memory = ConversationTokenBufferMemory(
+    llm=memory_llm,
+    max_token_limit=MAX_MEM_TOKENS,
+    human_prefix="User",
+    ai_prefix="Assistant",
+    memory_key="history",
+    return_messages=True,
+)
 
 def build_rag_chain():
     # -------------------------
@@ -299,31 +433,12 @@ def build_rag_chain():
     llm = AzureChatOpenAI(
         api_key=AZURE_OPENAI_API_KEY,
         azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        deployment_name=CHAT_MODEL,
+        deployment_name=CHAT_DEPLOYMENT_NAME,
+        model_name=CHAT_MODEL,
         api_version=AZURE_OPENAI_API_VER,
+        max_tokens=1024,
         temperature=0.25
     )
-
-    # -------------------------
-    # 7 · Summary chain (unchanged)
-    # -------------------------
-    summary_text = ""
-
-    summariser_prompt = PromptTemplate.from_template(
-        "Progressively summarize the conversation.\n\n"
-        "Current summary:\n{summary}\n\n"
-        "New lines:\n{lines}\n\n"
-        "Updated summary:"
-    )
-    summariser_chain = summariser_prompt | llm | StrOutputParser()
-
-    def update_summary(lines: str) -> str:
-        nonlocal summary_text
-        summary_text = summariser_chain.invoke({
-            "summary": summary_text,
-            "lines": lines
-        })
-        return summary_text
 
     # -------------------------
     # 8 · RAG chain (context → prompt → llm)
@@ -354,9 +469,13 @@ def build_rag_chain():
     format_docs = RunnableLambda(lambda docs: "\n\n".join(doc.page_content for doc in docs))
     rag_chain = (
         {
-            "context": itemgetter("retrieval_question") | retrieve_fn | format_docs,
-            "question": itemgetter("prompt_question"),
-            "history":  itemgetter("history"),
+            "context": RunnableLambda(lambda _: build_fused_query()) | retrieve_fn
+                    | (lambda docs: "\n\n".join(d.page_content for d in docs)),
+
+            "question":  itemgetter("prompt_question"),
+
+            # ⬇️ load the text buffer from memory at call-time
+            "history":   RunnableLambda(lambda _: memory.load_memory_variables({})["history"]),
         }
         | prompt
         | llm
@@ -370,13 +489,21 @@ def build_rag_chain():
 RAG_CHAIN = build_rag_chain()
 
 
-def stream_answer(question: str, history_summary: str = "(no prior context)") -> Iterable[str]:
-    """Generator that yields chunks for FastAPI’s StreamingResponse."""
-    inputs = {
-        "retrieval_question": question,
-        "prompt_question":    question,
-        "history":            history_summary,
-    }
-    for chunk in RAG_CHAIN.stream(inputs):
-        yield chunk if isinstance(chunk, str) else chunk.content
+def stream_answer(question: str) -> Iterable[str]:
+    """FastAPI streamer that updates user-query buffer and memory."""
+    # 1⃣  cache the user question
+    USER_QUERIES.append(question)
 
+    inputs = {
+        "prompt_question": question,   # fed to prompt
+    }
+
+    chunks = []
+    for piece in RAG_CHAIN.stream(inputs):
+        text = piece if isinstance(piece, str) else piece.content
+        chunks.append(text)
+        yield text
+
+    # 2⃣  store turn in memory
+    memory.save_context({"input": question},
+                        {"output": "".join(chunks)})

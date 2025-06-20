@@ -111,6 +111,7 @@ pyasn1_modules==0.4.2
 pydantic==2.11.3
 pydantic-settings==2.8.1
 pydantic_core==2.33.1
+pydantic[email]
 pydub==0.25.1
 Pygments==2.19.1
 PyPika==0.48.9
